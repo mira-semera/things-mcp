@@ -334,7 +334,7 @@ def _esc_applescript(s: str) -> str:
     return s.replace('\\', '\\\\').replace('"', '\\"')
 
 
-_prev_app = {"name": None, "windows": None}
+_prev_app = {"name": None}
 
 
 def _osascript(script: str) -> str:
@@ -344,22 +344,7 @@ def _osascript(script: str) -> str:
 
 def _restore_prev_app() -> None:
     name = _prev_app.get("name")
-    known = _prev_app.get("windows")
     _prev_app["name"] = None
-    _prev_app["windows"] = None
-    if known is not None:
-        # Close Things windows that ``show`` opened during the operation.
-        ids = "{" + ",".join(known) + "}" if known else "{}"
-        try:
-            _osascript(
-                'tell application "Things3"\n'
-                f'  set known to {ids}\n'
-                '  repeat with w in (get windows)\n'
-                '    if (id of w) is not in known then close w\n'
-                '  end repeat\n'
-                'end tell')
-        except subprocess.CalledProcessError:
-            pass
     if name and name != "Things3":
         try:
             _osascript(f'tell application "{_esc_applescript(name)}" to activate')
@@ -402,12 +387,6 @@ def open_new_heading_field(project_id: str, select_id: Optional[str] = None,
     pid = _esc_applescript(target)
     window_check = (f'    if name of front window is not "{_esc_applescript(project_title)}" then set shown to false\n'
                     if project_title else '')
-    try:
-        _prev_app["windows"] = [w for w in _osascript(
-            'tell application "Things3"\n  set out to ""\n  repeat with w in windows\n'
-            '    set out to out & (id of w) & ","\n  end repeat\n  return out\nend tell').split(",") if w]
-    except subprocess.CalledProcessError:
-        _prev_app["windows"] = None
     script = (
         'tell application "System Events" to set prevApp to name of first process whose frontmost is true\n'
         f'do shell script "open \\"{_esc_applescript(show_url)}\\""\n'
@@ -440,7 +419,12 @@ def open_new_heading_field(project_id: str, select_id: Optional[str] = None,
         'if not ok then return prevApp & "|clicked|no empty heading field got focus"\n'
         'return prevApp & "|ok"'
     )
-    prev, _, res = _osascript(script).partition("|")
+    try:
+        prev, _, res = _osascript(script).partition("|")
+    except subprocess.CalledProcessError as e:
+        # The script may have failed after the click: leave any edit and restore focus.
+        cancel_heading_field()
+        return f"the Things UI script failed ({(e.stderr or '').strip()[:120]}); any edit was discarded"
     _prev_app["name"] = prev
     if res != "ok":
         if res.startswith("clicked|"):
@@ -454,7 +438,7 @@ def open_new_heading_field(project_id: str, select_id: Optional[str] = None,
     return res
 
 
-def fill_focused_heading_field(title: str) -> str:
+def fill_focused_heading_field(title: str, project_title: Optional[str] = None) -> str:
     """Step 2: type the title into the new heading field and confirm it.
 
     Types only if Things is frontmost and the focused element is an empty
@@ -464,6 +448,8 @@ def fill_focused_heading_field(title: str) -> str:
     script = (
         'tell application "System Events"\n'
         '  if name of first process whose frontmost is true is not "Things3" then return "Things is no longer in front"\n'
+        + (f'  tell application "Things3" to if name of front window is not "{_esc_applescript(project_title)}" then return "the front Things window no longer shows the project"\n'
+           if project_title else '') +
         '  tell process "Things3"\n'
         '    set f to value of attribute "AXFocusedUIElement"\n'
         '    if (value of attribute "AXRole" of f) is not "AXTextField" or (value of f) is not "" then return "the focused element is not an empty text field"\n'
@@ -477,6 +463,8 @@ def fill_focused_heading_field(title: str) -> str:
     )
     try:
         return _osascript(script)
+    except subprocess.CalledProcessError as e:
+        return f"the Things UI script failed ({(e.stderr or '').strip()[:120]})"
     finally:
         _restore_prev_app()
 

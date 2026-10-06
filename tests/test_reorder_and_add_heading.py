@@ -258,7 +258,7 @@ async def test_refuses_area(fake, mocker):
 async def test_concurrent_run_is_refused(fake, tmp_path):
     import fcntl, os
     fake([('a', {}), ('b', {})])
-    held = open(os.path.join(str(tmp_path), "reorder.lock"), "w")
+    held = open(os.path.join(str(tmp_path), "mutation.lock"), "w")
     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         assert "in progress" in await reorder_todos(ids=['b'], project_id='P')
@@ -293,7 +293,7 @@ def heading_env(mocker, tmp_path, monkeypatch):
     def click(project_id, select_id, project_title):
         env['select_id'], env['project_title'] = select_id, project_title
         return 'ok'
-    def fill(title):
+    def fill(title, project_title=None):
         env['typed'] = title
         env['headings'].append({'uuid': 'new', 'title': title, 'type': 'heading', 'index': env['new_index']})
         return 'ok'
@@ -332,7 +332,7 @@ async def test_add_heading_aborted_before_click(heading_env):
 
 @pytest.mark.asyncio
 async def test_add_heading_discards_when_focus_moved_before_typing(heading_env):
-    heading_env['fill'].side_effect = lambda title: 'the focused element is not an empty text field'
+    heading_env['fill'].side_effect = lambda title, project_title=None: 'the focused element is not an empty text field'
     result = await add_heading(project_id='P', title='X')
     assert "discarded" in result
     heading_env['cancel'].assert_called_once()
@@ -341,7 +341,7 @@ async def test_add_heading_discards_when_focus_moved_before_typing(heading_env):
 @pytest.mark.asyncio
 async def test_add_heading_warns_when_not_last_or_todos_moved(heading_env):
     heading_env['new_index'] = 0
-    def fill(title):
+    def fill(title, project_title=None):
         heading_env['headings'].append({'uuid': 'new', 'title': title, 'type': 'heading', 'index': 0})
         heading_env['todo_heading']['t2'] = 'new'
         return 'ok'
@@ -353,7 +353,7 @@ async def test_add_heading_warns_when_not_last_or_todos_moved(heading_env):
 @pytest.mark.asyncio
 async def test_add_heading_refuses_concurrent_run(heading_env, tmp_path):
     import fcntl, os
-    held = open(os.path.join(str(tmp_path), "heading.lock"), "w")
+    held = open(os.path.join(str(tmp_path), "mutation.lock"), "w")
     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         assert "in progress" in await add_heading(project_id='P', title='X')
@@ -391,3 +391,40 @@ def test_ui_step_one_escapes_when_click_gave_no_field(mocker):
     run.return_value.stdout = 'cmux|clicked|no empty heading field got focus\n'
     assert url_scheme.open_new_heading_field(project_id='P') == 'no empty heading field got focus'
     assert any('key code 53' in c.args[0][2] for c in run.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_add_heading_checks_top_level_todos_too(heading_env):
+    heading_env['headings'].clear()
+    heading_env['todo_heading'] = {'top1': None}
+    def todos(**kw):
+        if kw.get('project') == 'P':
+            return [{'uuid': u, 'heading': h} for u, h in heading_env['todo_heading'].items()]
+        return [{'uuid': u, 'heading': h} for u, h in heading_env['todo_heading'].items() if h == kw.get('heading')]
+    import things
+    things.todos.side_effect = todos
+    def fill(title, project_title=None):
+        heading_env['headings'].append({'uuid': 'new', 'title': title, 'type': 'heading', 'index': 0})
+        heading_env['todo_heading']['top1'] = 'new'  # Things swallowed the top-level to-do
+        return 'ok'
+    heading_env['fill'].side_effect = fill
+    result = await add_heading(project_id='P', title='X')
+    assert result.startswith("Warning") and "top1" in result
+
+
+def test_ui_step_one_cleans_up_when_script_fails(mocker):
+    import subprocess
+    mocker.patch('things_mcp.url_scheme._screen_is_locked', return_value=False)
+    cancel = mocker.patch('things_mcp.url_scheme.cancel_heading_field')
+    mocker.patch('things_mcp.url_scheme.subprocess.run',
+                 side_effect=subprocess.CalledProcessError(1, 'osascript', stderr='boom'))
+    assert "discarded" in url_scheme.open_new_heading_field(project_id='P')
+    cancel.assert_called_once()
+
+
+def test_ui_step_two_rechecks_project_window(mocker):
+    run = mocker.patch('things_mcp.url_scheme.subprocess.run')
+    run.return_value.stdout = 'ok\n'
+    url_scheme.fill_focused_heading_field('t', project_title='Proj')
+    script = [c.args[0][2] for c in run.call_args_list if 'set value of f' in c.args[0][2]][0]
+    assert 'name of front window is not "Proj"' in script

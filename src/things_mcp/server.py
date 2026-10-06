@@ -987,9 +987,9 @@ async def reorder_todos(ids: List[str], project_id: str = None, heading_id: str 
     if len(set(ids)) != len(ids):
         return "Error: duplicate IDs."
 
-    lock = _Lock("reorder.lock")
+    lock = _Lock("mutation.lock")
     if not lock.acquire():
-        return "Error: another reorder_todos run is in progress, try again in a moment."
+        return "Error: another reorder_todos or add_heading run is in progress, try again in a moment."
     try:
         # Everything below is read under the lock, right before moving.
         parking = _get_or_create_parking_project()
@@ -1041,15 +1041,15 @@ async def reorder_todos(ids: List[str], project_id: str = None, heading_id: str 
             if not left:
                 return (f"Error: to-do {todo_id} behaved unexpectedly during the move but is back "
                         "in its list. Check the order in Things.")
+
+        # Let any late URL show up before judging the result, still under the lock.
+        time.sleep(1.0)
+        final = _container_todo_ids(project_id, heading_id)
+        if final == target:
+            return f"Reordered {len(to_cycle)} to-do(s); order verified."
+        return "Warning: order could not be verified. Current order: " + ", ".join(final)
     finally:
         lock.release()
-
-    # Let any late URL show up before judging the result.
-    time.sleep(1.0)
-    final = _container_todo_ids(project_id, heading_id)
-    if final == target:
-        return f"Reordered {len(to_cycle)} to-do(s); order verified."
-    return "Warning: order could not be verified. Current order: " + ", ".join(final)
 
 
 @mcp.tool
@@ -1072,14 +1072,16 @@ async def add_heading(project_id: str, title: str) -> str:
     project = things.get(project_id)
     if not project or project.get('type') != 'project':
         return f"Error: Invalid project UUID '{project_id}'"
-    lock = _Lock("heading.lock")
+    lock = _Lock("mutation.lock")
     if not lock.acquire():
-        return "Error: another add_heading run is in progress, try again in a moment."
+        return "Error: another reorder_todos or add_heading run is in progress, try again in a moment."
     try:
         headings = things.tasks(type='heading', project=project_id)
         before = {h['uuid'] for h in headings}
         membership = {t['uuid']: t.get('heading') for h in headings
                       for t in things.todos(heading=h['uuid'], status='incomplete')}
+        membership.update({t['uuid']: None for t in things.todos(project=project_id, status='incomplete')
+                           if not t.get('heading')})
         # Things inserts the heading after the selection: select the last open
         # to-do of the last heading so the new one lands at the end.
         select_id = None
@@ -1099,7 +1101,7 @@ async def add_heading(project_id: str, title: str) -> str:
                     "first, or create the heading by hand.") if last_heading_empty else ""
             return f"Error: nothing was created, {res}.{hint}"
 
-        res = url_scheme.fill_focused_heading_field(title)
+        res = url_scheme.fill_focused_heading_field(title, project_title=project.get('title'))
         if res != "ok":
             url_scheme.cancel_heading_field()
             return f"Error: {res}, so no title was typed and the heading was discarded."
