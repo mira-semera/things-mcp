@@ -1104,7 +1104,13 @@ async def add_heading(project_id: str, title: str) -> str:
         res = url_scheme.fill_focused_heading_field(title, project_title=project.get('title'))
         if res != "ok":
             url_scheme.cancel_heading_field()
-            return f"Error: {res}, so no title was typed and the heading was discarded."
+            time.sleep(0.5)
+            leftover = [h['uuid'] for h in things.tasks(type='heading', project=project_id)
+                        if h['uuid'] not in before]
+            if leftover:
+                return (f"Error: {res}, so no title was typed. Things kept an empty heading "
+                        f"(id: {', '.join(leftover)}); rename or delete it in Things.")
+            return f"Error: {res}, so no title was typed and nothing was created."
 
         # Things writes the heading to its database only once editing ends.
         fresh = []

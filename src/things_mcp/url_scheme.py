@@ -447,8 +447,8 @@ def fill_focused_heading_field(title: str, project_title: Optional[str] = None) 
     """
     script = (
         'tell application "System Events"\n'
-        '  if name of first process whose frontmost is true is not "Things3" then return "Things is no longer in front"\n'
-        + (f'  tell application "Things3" to if name of front window is not "{_esc_applescript(project_title)}" then return "the front Things window no longer shows the project"\n'
+        '  if (name of first process whose frontmost is true) is not "Things3" then return "Things is no longer in front"\n'
+        + (f'  if (name of front window of application "Things3") is not "{_esc_applescript(project_title)}" then return "the front Things window no longer shows the project"\n'
            if project_title else '') +
         '  tell process "Things3"\n'
         '    set f to value of attribute "AXFocusedUIElement"\n'

@@ -334,7 +334,7 @@ async def test_add_heading_aborted_before_click(heading_env):
 async def test_add_heading_discards_when_focus_moved_before_typing(heading_env):
     heading_env['fill'].side_effect = lambda title, project_title=None: 'the focused element is not an empty text field'
     result = await add_heading(project_id='P', title='X')
-    assert "discarded" in result
+    assert "no title was typed" in result
     heading_env['cancel'].assert_called_once()
 
 
@@ -382,7 +382,7 @@ def test_ui_scripts_check_window_selection_menu_and_focus(mocker):
     assert url_scheme.fill_focused_heading_field('a "b" \\ c') == 'ok'
     script = [c.args[0][2] for c in run.call_args_list if 'set value of f' in c.args[0][2]][0]
     assert 'set value of f to "a \\"b\\" \\\\ c"' in script
-    assert 'frontmost is true is not "Things3"' in script
+    assert '(name of first process whose frontmost is true) is not "Things3"' in script
 
 
 def test_ui_step_one_escapes_when_click_gave_no_field(mocker):
@@ -427,4 +427,4 @@ def test_ui_step_two_rechecks_project_window(mocker):
     run.return_value.stdout = 'ok\n'
     url_scheme.fill_focused_heading_field('t', project_title='Proj')
     script = [c.args[0][2] for c in run.call_args_list if 'set value of f' in c.args[0][2]][0]
-    assert 'name of front window is not "Proj"' in script
+    assert 'name of front window of application "Things3") is not "Proj"' in script
