@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import time
+import fcntl
+import sqlite3
 from datetime import datetime, timedelta
 import things
 from fastmcp import FastMCP
@@ -765,32 +767,186 @@ async def update_todo(
     return f"Updated todo with ID: {id}"
 
 REORDER_PARKING_TITLE = "things-mcp reorder buffer"
+REORDER_STATE_DIR = os.path.expanduser("~/.cache/things-mcp")
+STEP_TIMEOUT = 6.0
+
+
+def _things_db_path() -> str:
+    return things.database.Database().filepath
+
+
+def _db_rows(sql: str, params=()):
+    """Read-only query against the Things database (never writes)."""
+    con = sqlite3.connect(f"file:{_things_db_path()}?mode=ro", uri=True)
+    try:
+        return con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+
+
+def _todo_state(todo_id: str) -> dict:
+    rows = _db_rows(
+        'SELECT project, heading, start, startDate, reminderTime, '
+        'rt1_repeatingTemplate, rt1_recurrenceRule, trashed, status '
+        'FROM TMTask WHERE uuid = ?', (todo_id,))
+    if not rows:
+        return {}
+    project, heading, start, start_date, reminder, template, rule, trashed, status = rows[0]
+    return {'project': project, 'heading': heading, 'start': start, 'start_date': start_date,
+            'reminder': reminder, 'repeating': bool(template or rule),
+            'trashed': trashed, 'status': status}
 
 
 def _container_todo_ids(project_id: str = None, heading_id: str = None) -> List[str]:
-    """Open to-dos directly in a project (outside headings) or in one heading, in display order."""
+    """Open Anytime to-dos directly in a project (outside headings) or in one heading, in display order."""
     if heading_id:
         items = things.todos(heading=heading_id, status='incomplete')
     else:
         items = [t for t in things.todos(project=project_id, status='incomplete')
                  if not t.get('heading')]
-    return [t['uuid'] for t in items]
+    # Someday and later-scheduled to-dos are shown in a separate group at the
+    # bottom of the list, so they are not part of the visible order.
+    return [t['uuid'] for t in items if t.get('start', 'Anytime') == 'Anytime']
+
+
+def _container_has_repeating_templates(project_id: str, heading_id: str = None) -> bool:
+    """things.py hides repeating templates, but Things shows them in the list."""
+    col, val = ('heading', heading_id) if heading_id else ('project', project_id)
+    rows = _db_rows(f'SELECT COUNT(*) FROM TMTask WHERE {col} = ? AND trashed = 0 AND status = 0 '
+                    'AND rt1_recurrenceRule IS NOT NULL', (val,))
+    return bool(rows and rows[0][0])
+
+
+def _wait_for(todo_id: str, predicate, timeout: float = None) -> bool:
+    deadline = time.monotonic() + (timeout or STEP_TIMEOUT)
+    while time.monotonic() < deadline:
+        state = _todo_state(todo_id)
+        if state and predicate(state):
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def _send(url: str) -> bool:
+    """Hand a URL to Things. False if handing it over failed outright."""
+    try:
+        url_scheme.execute_url(url)
+        return True
+    except Exception as e:  # noqa: BLE001 - any failure means "not sent"
+        logger.warning("Things URL could not be sent: %s", e)
+        return False
+
+
+def _confirmed_move(url: str, todo_id: str, arrived) -> bool:
+    """Send one move and wait until the database shows it.
+
+    The URL is sent exactly once: a second copy could be applied later and
+    undo the next step. If it does not show up in time, wait one more
+    period before giving up, because Things sometimes applies URLs late.
+    """
+    if not _send(url):
+        return False
+    return _wait_for(todo_id, arrived) or _wait_for(todo_id, arrived)
+
+
+def _journal_path() -> str:
+    return os.path.join(REORDER_STATE_DIR, "inflight.json")
+
+
+def _journal(entry):
+    path = _journal_path()
+    if entry is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    with open(path, "w") as f:
+        json.dump(entry, f)
+
+
+def _parking_state_file() -> str:
+    return os.path.join(REORDER_STATE_DIR, "parking.json")
+
+
+def _parking_candidates():
+    return [p for p in things.projects(status='incomplete') if p.get('title') == REORDER_PARKING_TITLE]
 
 
 def _get_or_create_parking_project() -> str:
-    """Return the UUID of the Someday project used as a temporary parking spot."""
-    for p in things.projects(status='incomplete'):
-        if p.get('title') == REORDER_PARKING_TITLE:
-            return p['uuid']
-    url_scheme.execute_url(url_scheme.add_project(
-        title=REORDER_PARKING_TITLE, when="someday",
-        notes="Technical project used by things-mcp reorder_todos. It is empty between runs, do not delete."))
-    for _ in range(20):
-        time.sleep(0.3)
-        for p in things.projects(status='incomplete'):
-            if p.get('title') == REORDER_PARKING_TITLE:
-                return p['uuid']
-    raise RuntimeError("Could not create the reorder parking project")
+    """Return the UUID of the Someday project used as a temporary parking spot.
+
+    The UUID is remembered in a state file. If that file is missing or
+    stale, an existing project with the parking title is adopted, so to-dos
+    stranded there are not forgotten.
+    """
+    os.makedirs(REORDER_STATE_DIR, exist_ok=True)
+    try:
+        with open(_parking_state_file()) as f:
+            uuid = json.load(f).get('uuid')
+        p = things.get(uuid) if uuid else None
+        if p and p.get('type') == 'project' and p.get('status') == 'incomplete' \
+                and p.get('title') == REORDER_PARKING_TITLE and not _db_rows(
+                    'SELECT 1 FROM TMTask WHERE uuid = ? AND trashed = 1', (uuid,)):
+            return uuid
+    except (OSError, ValueError):
+        pass
+    candidates = _parking_candidates()
+    if candidates:
+        uuid = candidates[0]['uuid']
+    else:
+        before = {p['uuid'] for p in things.projects()}
+        _send(url_scheme.add_project(
+            title=REORDER_PARKING_TITLE, when="someday",
+            notes="Technical project used by things-mcp reorder_todos. It is empty between runs, do not delete or rename."))
+        uuid = None
+        deadline = time.monotonic() + STEP_TIMEOUT
+        while time.monotonic() < deadline and not uuid:
+            new = [p for p in things.projects() if p['uuid'] not in before
+                   and p.get('title') == REORDER_PARKING_TITLE]
+            uuid = new[0]['uuid'] if new else None
+            if not uuid:
+                time.sleep(0.2)
+        if not uuid:
+            raise RuntimeError("Could not create the reorder parking project")
+    with open(_parking_state_file(), "w") as f:
+        json.dump({'uuid': uuid}, f)
+    return uuid
+
+
+class _Lock:
+    """Cross-process exclusive lock in the state directory."""
+
+    def __init__(self, name):
+        os.makedirs(REORDER_STATE_DIR, exist_ok=True)
+        self.f = open(os.path.join(REORDER_STATE_DIR, name), "w")
+
+    def acquire(self) -> bool:
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            self.f.close()
+            return False
+
+    def release(self):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def _check_movable(ids, project_id, heading_id):
+    """Return an error message if some to-do cannot be moved safely, else None."""
+    if _container_has_repeating_templates(project_id, heading_id):
+        return "Error: this list contains repeating to-dos, reordering it is not supported."
+    states = {i: _todo_state(i) for i in ids}
+    repeating = [i for i, st in states.items() if st.get('repeating')]
+    if repeating:
+        return f"Error: repeating to-dos cannot be reordered: {', '.join(repeating)}"
+    dated = [i for i, st in states.items() if st.get('start_date')]
+    if dated:
+        titles = ", ".join(f"{(things.get(i) or {}).get('title', i)} ({i})" for i in dated)
+        return ("Error: these to-dos have a start date (Today or scheduled), Things would not "
+                f"place them at the end, so nothing was moved: {titles}. Remove the date first "
+                "or leave them where they are and reorder only the to-dos below them.")
+    return None
 
 
 @mcp.tool
@@ -800,8 +956,16 @@ async def reorder_todos(ids: List[str], project_id: str = None, heading_id: str 
     Things has no reorder API. Each to-do is moved to a parking project and
     back, which puts it at the end, so cycling them in the target order
     yields that order. To-dos you do not list keep their relative order and
-    end up after the listed ones. Takes about one second per to-do; the
-    result is read back and verified.
+    end up after the listed ones. Every move is sent once and confirmed in
+    the Things database before the next one; the final order is read back.
+    About one second per to-do.
+
+    Only plain to-dos can be moved this way: Things places a to-do that has
+    a start date (Today, or scheduled) somewhere else than the end, so the
+    call is refused if one of those would have to move. Someday and
+    later-scheduled to-dos sit in their own group at the bottom of the list
+    and are left alone. Not supported: loose to-dos directly in an area, and
+    lists that contain repeating to-dos.
 
     Args:
         ids: To-do UUIDs in the desired order (first = top)
@@ -815,33 +979,77 @@ async def reorder_todos(ids: List[str], project_id: str = None, heading_id: str 
         if not heading or heading.get('type') != 'heading':
             return f"Error: Invalid heading UUID '{heading_id}'"
         project_id = heading.get('project')
-    current = _container_todo_ids(project_id, heading_id)
-    unknown = [i for i in ids if i not in current]
-    if unknown:
-        return f"Error: these IDs are not open to-dos in the target list: {', '.join(unknown)}"
+    else:
+        project = things.get(project_id)
+        if not project or project.get('type') != 'project':
+            return (f"Error: '{project_id}' is not a project. Loose to-dos in an area "
+                    "cannot be reordered.")
     if len(set(ids)) != len(ids):
         return "Error: duplicate IDs."
-    target = list(ids) + [i for i in current if i not in ids]
-    if target == current:
-        return "Order already matches, nothing changed."
 
-    # Only items from the first one that is out of place need to move.
-    first_wrong = next(i for i, (a, b) in enumerate(zip(target, current)) if a != b)
-    to_cycle = target[first_wrong:]
-    parking = _get_or_create_parking_project()
-    for todo_id in to_cycle:
-        url_scheme.execute_url(url_scheme.update_todo(id=todo_id, list_id=parking))
-        time.sleep(0.4)
-        url_scheme.execute_url(url_scheme.update_todo(
-            id=todo_id, list_id=project_id, heading_id=heading_id))
-        time.sleep(0.4)
+    lock = _Lock("reorder.lock")
+    if not lock.acquire():
+        return "Error: another reorder_todos run is in progress, try again in a moment."
+    try:
+        # Everything below is read under the lock, right before moving.
+        parking = _get_or_create_parking_project()
+        stranded = [t for p in _parking_candidates() for t in things.todos(project=p['uuid'])]
+        if stranded:
+            return ("Error: the parking project still holds to-dos from an interrupted run, "
+                    "move them back first: " + ", ".join(f"{t['title']} ({t['uuid']})" for t in stranded))
+        if os.path.exists(_journal_path()):
+            _journal(None)  # previous run ended with its to-do back home (nothing is parked)
 
-    for _ in range(10):
-        if _container_todo_ids(project_id, heading_id) == target:
-            return f"Reordered {len(to_cycle)} to-do(s); order verified."
-        time.sleep(0.5)
-    return ("Warning: order could not be verified. Current order: "
-            + ", ".join(_container_todo_ids(project_id, heading_id)))
+        current = _container_todo_ids(project_id, heading_id)
+        unknown = [i for i in ids if i not in current]
+        if unknown:
+            return f"Error: these IDs are not open to-dos in the target list: {', '.join(unknown)}"
+        target = list(ids) + [i for i in current if i not in ids]
+        if target == current:
+            return "Order already matches, nothing changed."
+        first_wrong = next(i for i, (a, b) in enumerate(zip(target, current)) if a != b)
+        to_cycle = target[first_wrong:]
+        err = _check_movable(to_cycle, project_id, heading_id)
+        if err:
+            return err
+
+        def at_home(st):
+            if heading_id:
+                return st['heading'] == heading_id
+            return st['project'] == project_id and not st['heading']
+
+        for n, todo_id in enumerate(to_cycle):
+            _journal({'todo': todo_id, 'project': project_id, 'heading': heading_id, 'parking': parking})
+            left = _confirmed_move(url_scheme.update_todo(id=todo_id, list_id=parking),
+                                   todo_id, lambda st: st['project'] == parking)
+            if not left:
+                state = _todo_state(todo_id)
+                if state and at_home(state):
+                    _journal(None)
+                    return (f"Error: stopped at to-do {todo_id}: Things did not apply the move. "
+                            f"Nothing changed for it; {n} of {len(to_cycle)} to-dos were reordered.")
+                # It left but not to the parking project, or its state is unclear:
+                # do not guess, try to bring it home and report.
+            back = _confirmed_move(url_scheme.update_todo(id=todo_id, list_id=project_id, heading_id=heading_id),
+                                   todo_id, at_home)
+            if not back:
+                state = _todo_state(todo_id)
+                where = "the parking project" if state.get('project') == parking else "an unknown place"
+                return (f"Error: to-do {todo_id} could not be moved back and is in {where} "
+                        f"('{REORDER_PARKING_TITLE}' is the parking project). Move it back manually.")
+            _journal(None)
+            if not left:
+                return (f"Error: to-do {todo_id} behaved unexpectedly during the move but is back "
+                        "in its list. Check the order in Things.")
+    finally:
+        lock.release()
+
+    # Let any late URL show up before judging the result.
+    time.sleep(1.0)
+    final = _container_todo_ids(project_id, heading_id)
+    if final == target:
+        return f"Reordered {len(to_cycle)} to-do(s); order verified."
+    return "Warning: order could not be verified. Current order: " + ", ".join(final)
 
 
 @mcp.tool
@@ -850,9 +1058,12 @@ async def add_heading(project_id: str, title: str) -> str:
 
     Things has no API for this, so it drives the Things UI (File > New
     Heading). Requires the English Things UI and Accessibility permission;
-    Things comes to the foreground for about a second. Avoid typing while it
-    runs. The new heading is verified and its UUID returned, so you can move
-    to-dos into it with update_todo(heading_id=...).
+    Things comes to the foreground for a moment. Avoid typing while it runs.
+    The title is typed only after the right project is in the front Things
+    window, its last item is selected and an empty text field has focus;
+    otherwise the edit is discarded and nothing is created.
+    The result is verified (title, last position, no to-do moved) and the
+    UUID returned, so you can move to-dos into it with update_todo(heading_id=...).
 
     Args:
         project_id: UUID of the project
@@ -861,19 +1072,65 @@ async def add_heading(project_id: str, title: str) -> str:
     project = things.get(project_id)
     if not project or project.get('type') != 'project':
         return f"Error: Invalid project UUID '{project_id}'"
-    before = {h['uuid'] for h in things.tasks(type='heading', project=project_id)}
-    url_scheme.create_heading_via_ui(project_id=project_id, title=title)
-    for _ in range(10):
-        new = [h for h in things.tasks(type='heading', project=project_id)
-               if h['uuid'] not in before]
-        if new:
-            h = new[0]
-            if h.get('title') == title:
-                return f"Created heading: {title} (id: {h['uuid']})"
-            return (f"Warning: heading created but its title is {h.get('title')!r} "
-                    f"instead of {title!r} (id: {h['uuid']}). Fix it in Things.")
-        time.sleep(0.5)
-    return "Error: no new heading appeared. Check the English UI and Accessibility permission."
+    lock = _Lock("heading.lock")
+    if not lock.acquire():
+        return "Error: another add_heading run is in progress, try again in a moment."
+    try:
+        headings = things.tasks(type='heading', project=project_id)
+        before = {h['uuid'] for h in headings}
+        membership = {t['uuid']: t.get('heading') for h in headings
+                      for t in things.todos(heading=h['uuid'], status='incomplete')}
+        # Things inserts the heading after the selection: select the last open
+        # to-do of the last heading so the new one lands at the end.
+        select_id = None
+        last_heading_empty = False
+        if headings:
+            last = max(headings, key=lambda h: h.get('index', 0))
+            inside = things.todos(heading=last['uuid'], status='incomplete')
+            if inside:
+                select_id = inside[-1]['uuid']
+            else:
+                select_id, last_heading_empty = last['uuid'], True
+
+        res = url_scheme.open_new_heading_field(project_id=project_id, select_id=select_id,
+                                                 project_title=project.get('title'))
+        if res != "ok":
+            hint = (" The last heading is empty and Things cannot select it; add a to-do to it "
+                    "first, or create the heading by hand.") if last_heading_empty else ""
+            return f"Error: nothing was created, {res}.{hint}"
+
+        res = url_scheme.fill_focused_heading_field(title)
+        if res != "ok":
+            url_scheme.cancel_heading_field()
+            return f"Error: {res}, so no title was typed and the heading was discarded."
+
+        # Things writes the heading to its database only once editing ends.
+        fresh = []
+        deadline = time.monotonic() + STEP_TIMEOUT
+        while time.monotonic() < deadline and not fresh:
+            fresh = [h for h in things.tasks(type='heading', project=project_id) if h['uuid'] not in before]
+            if not fresh:
+                time.sleep(0.15)
+        if len(fresh) != 1:
+            return (f"Error: expected one new heading in the project, found {len(fresh)}. "
+                    "Check the project in Things.")
+        h = fresh[0]
+        h_id = h['uuid']
+        after = things.tasks(type='heading', project=project_id)
+        notes = []
+        if h.get('title') != title:
+            notes.append(f"its title is {h.get('title')!r} instead of {title!r}")
+        others = [o.get('index', 0) for o in after if o['uuid'] != h_id]
+        if others and h.get('index', 0) <= max(others):
+            notes.append("it is not the last heading")
+        moved = [u for u, hd in membership.items() if (things.get(u) or {}).get('heading') != hd]
+        if moved:
+            notes.append(f"{len(moved)} to-do(s) changed heading: {', '.join(moved)}")
+        if notes:
+            return f"Warning: heading created (id: {h_id}) but " + "; ".join(notes) + ". Check it in Things."
+        return f"Created heading: {title} (id: {h_id})"
+    finally:
+        lock.release()
 
 
 @mcp.tool

@@ -334,43 +334,157 @@ def _esc_applescript(s: str) -> str:
     return s.replace('\\', '\\\\').replace('"', '\\"')
 
 
-def create_heading_via_ui(project_id: str, title: str) -> None:
-    """Create a heading at the end of a project by driving the Things UI.
+_prev_app = {"name": None, "windows": None}
+
+
+def _osascript(script: str) -> str:
+    result = subprocess.run(['osascript', '-e', script], check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def _restore_prev_app() -> None:
+    name = _prev_app.get("name")
+    known = _prev_app.get("windows")
+    _prev_app["name"] = None
+    _prev_app["windows"] = None
+    if known is not None:
+        # Close Things windows that ``show`` opened during the operation.
+        ids = "{" + ",".join(known) + "}" if known else "{}"
+        try:
+            _osascript(
+                'tell application "Things3"\n'
+                f'  set known to {ids}\n'
+                '  repeat with w in (get windows)\n'
+                '    if (id of w) is not in known then close w\n'
+                '  end repeat\n'
+                'end tell')
+        except subprocess.CalledProcessError:
+            pass
+    if name and name != "Things3":
+        try:
+            _osascript(f'tell application "{_esc_applescript(name)}" to activate')
+        except subprocess.CalledProcessError:
+            pass
+
+
+def _screen_is_locked() -> bool:
+    """True when the login session is locked (Accessibility sees no windows then)."""
+    try:
+        out = subprocess.run(['ioreg', '-n', 'Root', '-d1', '-a'],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    marker = '<key>CGSSessionScreenIsLocked</key>'
+    i = out.find(marker)
+    return i != -1 and out[i + len(marker):i + len(marker) + 40].lstrip().startswith('<true/>')
+
+
+def open_new_heading_field(project_id: str, select_id: Optional[str] = None,
+                           project_title: Optional[str] = None) -> str:
+    """Step 1 of adding a heading through the Things UI (File > New Heading).
 
     Neither the URL scheme nor AppleScript can add a heading to an existing
-    project (JSON ``items`` only work on project creation). This shows the
-    project, clicks File > New Heading and types the title into the focused
-    field via the Accessibility API, then gives focus back to the app that
-    was frontmost before.
+    project. Things inserts a new heading after the selected item, so the
+    caller passes the last item of the project as ``select_id`` (or nothing
+    for a project without headings; then the project itself is selected).
+    This shows that item, checks that exactly it is selected and clicks
+    File > New Heading. It types nothing: the caller first confirms in the
+    database that an empty heading appeared in the project, then calls
+    ``fill_focused_heading_field``.
 
-    Requirements and limits:
-    - Things must use the English UI ("File" > "New Heading").
-    - The process running the server needs Accessibility permission.
-    - Things comes to the foreground for about a second.
+    Returns "ok" or a short reason why it stopped before clicking.
+    Requires the English Things UI and Accessibility permission.
     """
-    show_url = construct_url('show', {'id': project_id})
-    applescript = (
+    if _screen_is_locked():
+        return "the screen is locked, the Things UI cannot be driven"
+    target = select_id or project_id
+    show_url = construct_url('show', {'id': target})
+    pid = _esc_applescript(target)
+    window_check = (f'    if name of front window is not "{_esc_applescript(project_title)}" then set shown to false\n'
+                    if project_title else '')
+    try:
+        _prev_app["windows"] = [w for w in _osascript(
+            'tell application "Things3"\n  set out to ""\n  repeat with w in windows\n'
+            '    set out to out & (id of w) & ","\n  end repeat\n  return out\nend tell').split(",") if w]
+    except subprocess.CalledProcessError:
+        _prev_app["windows"] = None
+    script = (
         'tell application "System Events" to set prevApp to name of first process whose frontmost is true\n'
         f'do shell script "open \\"{_esc_applescript(show_url)}\\""\n'
-        'delay 1\n'
         'tell application "Things3" to activate\n'
-        'delay 0.4\n'
-        'tell application "System Events" to tell process "Things3"\n'
-        '  click menu item "New Heading" of menu 1 of menu bar item "File" of menu bar 1\n'
-        '  delay 0.6\n'
-        '  set f to value of attribute "AXFocusedUIElement"\n'
-        f'  set value of f to "{_esc_applescript(title)}"\n'
+        'set shown to false\n'
+        'repeat 20 times\n'
         '  delay 0.2\n'
-        '  key code 36\n'
+        '  tell application "Things3"\n'
+        '    set sel to selected to dos\n'
+        f'    if (count of sel) is 1 and id of item 1 of sel is "{pid}" then set shown to true\n'
+        + window_check +
+        '  end tell\n'
+        '  if shown then exit repeat\n'
+        'end repeat\n'
+        'if not shown then return prevApp & "|Things did not select the expected item in the project"\n'
+        'tell application "System Events" to tell process "Things3"\n'
+        '  set mi to menu item "New Heading" of menu 1 of menu bar item "File" of menu bar 1\n'
+        '  if not (enabled of mi) then return prevApp & "|File > New Heading is not available in the front Things window"\n'
+        '  click mi\n'
+        '  set ok to false\n'
+        '  repeat 15 times\n'
+        '    delay 0.2\n'
+        '    set f to value of attribute "AXFocusedUIElement"\n'
+        '    if (value of attribute "AXRole" of f) is "AXTextField" and (value of f) is "" then\n'
+        '      set ok to true\n'
+        '      exit repeat\n'
+        '    end if\n'
+        '  end repeat\n'
+        'end tell\n'
+        'if not ok then return prevApp & "|clicked|no empty heading field got focus"\n'
+        'return prevApp & "|ok"'
+    )
+    prev, _, res = _osascript(script).partition("|")
+    _prev_app["name"] = prev
+    if res != "ok":
+        if res.startswith("clicked|"):
+            # A heading row may be in edit mode: leave it so Things discards it.
+            try:
+                _osascript('tell application "System Events" to tell process "Things3" to key code 53')
+            except subprocess.CalledProcessError:
+                pass
+            res = res.split("|", 1)[1]
+        _restore_prev_app()
+    return res
+
+
+def fill_focused_heading_field(title: str) -> str:
+    """Step 2: type the title into the new heading field and confirm it.
+
+    Types only if Things is frontmost and the focused element is an empty
+    text field. Returns "ok" or a short reason. Gives focus back to the app
+    that was frontmost before step 1.
+    """
+    script = (
+        'tell application "System Events"\n'
+        '  if name of first process whose frontmost is true is not "Things3" then return "Things is no longer in front"\n'
+        '  tell process "Things3"\n'
+        '    set f to value of attribute "AXFocusedUIElement"\n'
+        '    if (value of attribute "AXRole" of f) is not "AXTextField" or (value of f) is not "" then return "the focused element is not an empty text field"\n'
+        f'    set value of f to "{_esc_applescript(title)}"\n'
+        '    delay 0.2\n'
+        '    key code 36\n'
+        '  end tell\n'
         'end tell\n'
         'delay 0.3\n'
-        'if prevApp is not "Things3" then\n'
-        '  try\n'
-        '    tell application prevApp to activate\n'
-        '  end try\n'
-        'end if'
+        'return "ok"'
     )
-    subprocess.run(
-        ['osascript', '-e', applescript],
-        check=True, capture_output=True, text=True
-    )
+    try:
+        return _osascript(script)
+    finally:
+        _restore_prev_app()
+
+
+def cancel_heading_field() -> None:
+    """Leave the heading field (Escape) and give focus back."""
+    try:
+        _osascript('tell application "System Events" to tell process "Things3" to key code 53')
+    except subprocess.CalledProcessError:
+        pass
+    _restore_prev_app()
