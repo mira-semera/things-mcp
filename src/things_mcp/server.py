@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 import things
 from fastmcp import FastMCP
@@ -762,6 +763,118 @@ async def update_todo(
     )
     url_scheme.execute_url(url)
     return f"Updated todo with ID: {id}"
+
+REORDER_PARKING_TITLE = "things-mcp reorder buffer"
+
+
+def _container_todo_ids(project_id: str = None, heading_id: str = None) -> List[str]:
+    """Open to-dos directly in a project (outside headings) or in one heading, in display order."""
+    if heading_id:
+        items = things.todos(heading=heading_id, status='incomplete')
+    else:
+        items = [t for t in things.todos(project=project_id, status='incomplete')
+                 if not t.get('heading')]
+    return [t['uuid'] for t in items]
+
+
+def _get_or_create_parking_project() -> str:
+    """Return the UUID of the Someday project used as a temporary parking spot."""
+    for p in things.projects(status='incomplete'):
+        if p.get('title') == REORDER_PARKING_TITLE:
+            return p['uuid']
+    url_scheme.execute_url(url_scheme.add_project(
+        title=REORDER_PARKING_TITLE, when="someday",
+        notes="Technical project used by things-mcp reorder_todos. It is empty between runs, do not delete."))
+    for _ in range(20):
+        time.sleep(0.3)
+        for p in things.projects(status='incomplete'):
+            if p.get('title') == REORDER_PARKING_TITLE:
+                return p['uuid']
+    raise RuntimeError("Could not create the reorder parking project")
+
+
+@mcp.tool
+async def reorder_todos(ids: List[str], project_id: str = None, heading_id: str = None) -> str:
+    """Reorder open to-dos inside a project (outside headings) or inside one heading.
+
+    Things has no reorder API. Each to-do is moved to a parking project and
+    back, which puts it at the end, so cycling them in the target order
+    yields that order. To-dos you do not list keep their relative order and
+    end up after the listed ones. Takes about one second per to-do; the
+    result is read back and verified.
+
+    Args:
+        ids: To-do UUIDs in the desired order (first = top)
+        project_id: UUID of the project (required unless heading_id is given)
+        heading_id: UUID of a heading to reorder inside it instead
+    """
+    if not project_id and not heading_id:
+        return "Error: pass project_id or heading_id."
+    if heading_id:
+        heading = things.get(heading_id)
+        if not heading or heading.get('type') != 'heading':
+            return f"Error: Invalid heading UUID '{heading_id}'"
+        project_id = heading.get('project')
+    current = _container_todo_ids(project_id, heading_id)
+    unknown = [i for i in ids if i not in current]
+    if unknown:
+        return f"Error: these IDs are not open to-dos in the target list: {', '.join(unknown)}"
+    if len(set(ids)) != len(ids):
+        return "Error: duplicate IDs."
+    target = list(ids) + [i for i in current if i not in ids]
+    if target == current:
+        return "Order already matches, nothing changed."
+
+    # Only items from the first one that is out of place need to move.
+    first_wrong = next(i for i, (a, b) in enumerate(zip(target, current)) if a != b)
+    to_cycle = target[first_wrong:]
+    parking = _get_or_create_parking_project()
+    for todo_id in to_cycle:
+        url_scheme.execute_url(url_scheme.update_todo(id=todo_id, list_id=parking))
+        time.sleep(0.4)
+        url_scheme.execute_url(url_scheme.update_todo(
+            id=todo_id, list_id=project_id, heading_id=heading_id))
+        time.sleep(0.4)
+
+    for _ in range(10):
+        if _container_todo_ids(project_id, heading_id) == target:
+            return f"Reordered {len(to_cycle)} to-do(s); order verified."
+        time.sleep(0.5)
+    return ("Warning: order could not be verified. Current order: "
+            + ", ".join(_container_todo_ids(project_id, heading_id)))
+
+
+@mcp.tool
+async def add_heading(project_id: str, title: str) -> str:
+    """Add a heading (section) at the end of an existing project
+
+    Things has no API for this, so it drives the Things UI (File > New
+    Heading). Requires the English Things UI and Accessibility permission;
+    Things comes to the foreground for about a second. Avoid typing while it
+    runs. The new heading is verified and its UUID returned, so you can move
+    to-dos into it with update_todo(heading_id=...).
+
+    Args:
+        project_id: UUID of the project
+        title: Title of the new heading
+    """
+    project = things.get(project_id)
+    if not project or project.get('type') != 'project':
+        return f"Error: Invalid project UUID '{project_id}'"
+    before = {h['uuid'] for h in things.tasks(type='heading', project=project_id)}
+    url_scheme.create_heading_via_ui(project_id=project_id, title=title)
+    for _ in range(10):
+        new = [h for h in things.tasks(type='heading', project=project_id)
+               if h['uuid'] not in before]
+        if new:
+            h = new[0]
+            if h.get('title') == title:
+                return f"Created heading: {title} (id: {h['uuid']})"
+            return (f"Warning: heading created but its title is {h.get('title')!r} "
+                    f"instead of {title!r} (id: {h['uuid']}). Fix it in Things.")
+        time.sleep(0.5)
+    return "Error: no new heading appeared. Check the English UI and Accessibility permission."
+
 
 @mcp.tool
 async def bulk_update_todos(

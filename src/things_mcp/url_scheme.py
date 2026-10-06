@@ -327,3 +327,50 @@ def show(id: str, query: Optional[str] = None, filter_tags: Optional[list[str]] 
 def search(query: str) -> str:
     """Construct URL to perform a search."""
     return construct_url('search', {'query': query})
+
+
+def _esc_applescript(s: str) -> str:
+    """Escape a string for embedding in an AppleScript string literal."""
+    return s.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def create_heading_via_ui(project_id: str, title: str) -> None:
+    """Create a heading at the end of a project by driving the Things UI.
+
+    Neither the URL scheme nor AppleScript can add a heading to an existing
+    project (JSON ``items`` only work on project creation). This shows the
+    project, clicks File > New Heading and types the title into the focused
+    field via the Accessibility API, then gives focus back to the app that
+    was frontmost before.
+
+    Requirements and limits:
+    - Things must use the English UI ("File" > "New Heading").
+    - The process running the server needs Accessibility permission.
+    - Things comes to the foreground for about a second.
+    """
+    show_url = construct_url('show', {'id': project_id})
+    applescript = (
+        'tell application "System Events" to set prevApp to name of first process whose frontmost is true\n'
+        f'do shell script "open \\"{_esc_applescript(show_url)}\\""\n'
+        'delay 1\n'
+        'tell application "Things3" to activate\n'
+        'delay 0.4\n'
+        'tell application "System Events" to tell process "Things3"\n'
+        '  click menu item "New Heading" of menu 1 of menu bar item "File" of menu bar 1\n'
+        '  delay 0.6\n'
+        '  set f to value of attribute "AXFocusedUIElement"\n'
+        f'  set value of f to "{_esc_applescript(title)}"\n'
+        '  delay 0.2\n'
+        '  key code 36\n'
+        'end tell\n'
+        'delay 0.3\n'
+        'if prevApp is not "Things3" then\n'
+        '  try\n'
+        '    tell application prevApp to activate\n'
+        '  end try\n'
+        'end if'
+    )
+    subprocess.run(
+        ['osascript', '-e', applescript],
+        check=True, capture_output=True, text=True
+    )
